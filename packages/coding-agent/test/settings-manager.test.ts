@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import lockfile from "proper-lockfile";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FileSettingsStorage, SettingsManager } from "../src/core/settings-manager.js";
 
 describe("SettingsManager", () => {
 	const testDir = join(process.cwd(), "test-settings-tmp");
@@ -253,6 +254,85 @@ describe("SettingsManager", () => {
 
 			// And settings file should be created
 			expect(existsSync(join(projectDir, ".pi", "settings.json"))).toBe(true);
+		});
+	});
+
+	describe("lockSync retry on contention", () => {
+		it("should retry and succeed when lock is held briefly", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
+
+			// Mock lockSync: first 2 calls throw ELOCKED (another pi holds lock),
+			// third call succeeds (other pi released lock between retries)
+			const releaseFn = vi.fn();
+			const spy = vi
+				.spyOn(lockfile, "lockSync")
+				.mockImplementationOnce(() => {
+					throw Object.assign(new Error("ELOCKED"), { code: "ELOCKED" });
+				})
+				.mockImplementationOnce(() => {
+					throw Object.assign(new Error("ELOCKED"), { code: "ELOCKED" });
+				})
+				.mockReturnValueOnce(releaseFn);
+
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+			let readContent: string | undefined;
+			storage.withLock("global", (current) => {
+				readContent = current;
+				return undefined;
+			});
+
+			const parsed = JSON.parse(readContent!);
+			expect(parsed.theme).toBe("dark");
+			expect(spy).toHaveBeenCalledTimes(3);
+			expect(releaseFn).toHaveBeenCalledOnce();
+
+			spy.mockRestore();
+		});
+
+		it("should throw after exhausting retries on persistent lock", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
+
+			// Hold the lock and never release (simulate stuck process)
+			const release = lockfile.lockSync(settingsPath, { realpath: false });
+
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+			try {
+				expect(() => {
+					storage.withLock("global", (_current) => undefined);
+				}).toThrow();
+			} finally {
+				release();
+			}
+		});
+
+		it("should work without contention (normal path)", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ defaultModel: "claude-opus" }));
+
+			const storage = new FileSettingsStorage(projectDir, agentDir);
+			let readContent: string | undefined;
+			storage.withLock("global", (current) => {
+				readContent = current;
+				return undefined;
+			});
+
+			expect(JSON.parse(readContent!).defaultModel).toBe("claude-opus");
+		});
+
+		it("should handle concurrent SettingsManager.create calls", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark", defaultModel: "claude-opus" }));
+
+			// Simulate two pi instances starting at the same time
+			const manager1 = SettingsManager.create(projectDir, agentDir);
+			const manager2 = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager1.getTheme()).toBe("dark");
+			expect(manager2.getTheme()).toBe("dark");
+			expect(manager1.getDefaultModel()).toBe("claude-opus");
+			expect(manager2.getDefaultModel()).toBe("claude-opus");
 		});
 	});
 
