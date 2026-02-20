@@ -61,13 +61,37 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 		}
 	}
 
+	private lockSyncWithRetry(): () => void {
+		const maxRetries = 5;
+		const retryDelayMs = 100;
+
+		for (let attempt = 0; attempt <= maxRetries; attempt++) {
+			try {
+				return lockfile.lockSync(this.authPath, { realpath: false });
+			} catch (err: unknown) {
+				const lockErr = err as { code?: string };
+				if (lockErr.code === "ELOCKED" && attempt < maxRetries) {
+					const until = Date.now() + retryDelayMs;
+					while (Date.now() < until) {
+						/* sync wait for lock release */
+					}
+					continue;
+				}
+				throw err;
+			}
+		}
+
+		// Unreachable, but satisfies TypeScript
+		throw new Error("Failed to acquire lock");
+	}
+
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T {
 		this.ensureParentDir();
 		this.ensureFileExists();
 
 		let release: (() => void) | undefined;
 		try {
-			release = lockfile.lockSync(this.authPath, { realpath: false });
+			release = this.lockSyncWithRetry();
 			const current = existsSync(this.authPath) ? readFileSync(this.authPath, "utf-8") : undefined;
 			const { result, next } = fn(current);
 			if (next !== undefined) {
